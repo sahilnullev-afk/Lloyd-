@@ -125,9 +125,8 @@ class VcTracker(commands.Cog):
 
     @property
     def collection(self):
-        # Universal MongoDB collection instance fetch
-        if self.bot.db is not None:
-            return self.bot.db['vc_logs']
+        if getattr(self.bot, "async_db", None) is not None:
+            return self.bot.async_db["vc_logs"]
         return None
 
     def format_seconds(self, seconds):
@@ -158,7 +157,7 @@ class VcTracker(commands.Cog):
                 ch_id, join_time = session
                 duration = int((now - join_time).total_seconds())
                 if duration > 0:
-                    self.collection.insert_one({
+                    await self.collection.insert_one({
                         "guild_id": member.guild.id,
                         "channel_id": ch_id,
                         "user_id": member.id,
@@ -173,7 +172,7 @@ class VcTracker(commands.Cog):
                 ch_id, join_time = session
                 duration = int((now - join_time).total_seconds())
                 if duration > 0:
-                    self.collection.insert_one({
+                    await self.collection.insert_one({
                         "guild_id": member.guild.id,
                         "channel_id": ch_id,
                         "user_id": member.id,
@@ -181,6 +180,15 @@ class VcTracker(commands.Cog):
                         "timestamp": now
                     })
             self.active_sessions[member.id] = (after.channel.id, now)
+
+    @commands.Cog.listener()
+    async def on_ready_restore_voice(self):
+        now = datetime.now(timezone.utc)
+        for guild in self.bot.guilds:
+            for member in guild.members:
+                if member.bot or not member.voice or not member.voice.channel:
+                    continue
+                self.active_sessions.setdefault(member.id, (member.voice.channel.id, now))
 
     async def get_vc_top_data(self, guild, author):
         if self.collection is None:
@@ -194,7 +202,23 @@ class VcTracker(commands.Cog):
             {"$sort": {"total_duration": -1}},
             {"$limit": 20}
         ]
-        rows = list(self.collection.aggregate(pipeline))
+        rows = await self.collection.aggregate(pipeline).to_list(length=20)
+
+        # Include currently active VC sessions too, so !vc / !vc top shows time
+        # immediately instead of waiting for the member to leave VC.
+        active = {}
+        now = datetime.now(timezone.utc)
+        for user_id, (channel_id, join_time) in self.active_sessions.items():
+            member = guild.get_member(user_id)
+            if member and member.voice and member.voice.channel:
+                active[user_id] = int((now - join_time).total_seconds())
+        totals = {int(r["_id"]): int(r["total_duration"]) for r in rows}
+        for uid, seconds in active.items():
+            totals[uid] = totals.get(uid, 0) + seconds
+        if active:
+            rows = [{"_id": uid, "total_duration": sec} for uid, sec in totals.items()]
+            rows.sort(key=lambda x: x["total_duration"], reverse=True)
+            rows = rows[:20]
 
         if not rows:
             embed = discord.Embed(
@@ -220,7 +244,7 @@ class VcTracker(commands.Cog):
             {"$sort": {"total_duration": -1}},
             {"$limit": 10}
         ]
-        rows = list(self.collection.aggregate(pipeline))
+        rows = await self.collection.aggregate(pipeline).to_list(length=20)
 
         embed = discord.Embed(title="👑 Top VC Active Members (Weekly / 7 Days)", color=discord.Color.red())
 
@@ -251,7 +275,7 @@ class VcTracker(commands.Cog):
             {"$group": {"_id": "$channel_id", "total_sec": {"$sum": "$duration_seconds"}}},
             {"$sort": {"total_sec": -1}}
         ]
-        rows = list(self.collection.aggregate(pipeline))
+        rows = await self.collection.aggregate(pipeline).to_list(length=20)
 
         embed = discord.Embed(
             title=f"📊 24h VC Activity Breakdown — {target_user.display_name}",
@@ -292,7 +316,7 @@ class VcTracker(commands.Cog):
             {"$match": {"guild_id": guild.id, "user_id": target_user.id, "timestamp": {"$gte": time_24h_ago}}},
             {"$group": {"_id": None, "total": {"$sum": "$duration_seconds"}}}
         ]
-        res_24h = list(self.collection.aggregate(pipeline_24h))
+        res_24h = await self.collection.aggregate(pipeline_24h).to_list(length=1)
         sec_24h = res_24h[0]["total"] if res_24h else 0
 
         # 7d Total
@@ -300,7 +324,7 @@ class VcTracker(commands.Cog):
             {"$match": {"guild_id": guild.id, "user_id": target_user.id, "timestamp": {"$gte": time_7d_ago}}},
             {"$group": {"_id": None, "total": {"$sum": "$duration_seconds"}}}
         ]
-        res_7d = list(self.collection.aggregate(pipeline_7d))
+        res_7d = await self.collection.aggregate(pipeline_7d).to_list(length=1)
         sec_7d = res_7d[0]["total"] if res_7d else 0
 
         embed = discord.Embed(
@@ -331,14 +355,22 @@ class VcTracker(commands.Cog):
 
     @commands.hybrid_group(name="vc", invoke_without_command=True)
     async def vc_group(self, ctx, member: discord.Member = None):
-        target = member or ctx.author
-        embed, view = await self.get_vc_user_data(ctx.guild, target)
-        await ctx.send(embed=embed, view=view)
+        try:
+            target = member or ctx.author
+            embed, view = await self.get_vc_user_data(ctx.guild, target)
+            await ctx.send(embed=embed, view=view)
+        except Exception as e:
+            print(f"[VcTracker] !vc error: {e}")
+            await ctx.send("❌ Voice tracker error. Check MongoDB connection.")
 
     @vc_group.command(name="top")
     async def vc_top(self, ctx):
-        embed, view = await self.get_vc_top_data(ctx.guild, ctx.author)
-        await ctx.send(embed=embed, view=view)
+        try:
+            embed, view = await self.get_vc_top_data(ctx.guild, ctx.author)
+            await ctx.send(embed=embed, view=view)
+        except Exception as e:
+            print(f"[VcTracker] !vc top error: {e}")
+            await ctx.send("❌ Voice tracker error. Check MongoDB connection.")
 
     @vc_group.command(name="help")
     async def vc_help_cmd(self, ctx):
@@ -347,14 +379,22 @@ class VcTracker(commands.Cog):
 
     @commands.hybrid_group(name="vcw", invoke_without_command=True)
     async def vcw_group(self, ctx, member: discord.Member = None):
-        target = member or ctx.author
-        embed, view = await self.get_vcw_user_data(ctx.guild, target)
-        await ctx.send(embed=embed, view=view)
+        try:
+            target = member or ctx.author
+            embed, view = await self.get_vcw_user_data(ctx.guild, target)
+            await ctx.send(embed=embed, view=view)
+        except Exception as e:
+            print(f"[VcTracker] !vcw error: {e}")
+            await ctx.send("❌ Voice tracker error. Check MongoDB connection.")
 
     @vcw_group.command(name="top")
     async def vcw_top(self, ctx):
-        embed, view = await self.get_vcw_top_data(ctx.guild, ctx.author)
-        await ctx.send(embed=embed, view=view)
+        try:
+            embed, view = await self.get_vcw_top_data(ctx.guild, ctx.author)
+            await ctx.send(embed=embed, view=view)
+        except Exception as e:
+            print(f"[VcTracker] !vcw top error: {e}")
+            await ctx.send("❌ Voice tracker error. Check MongoDB connection.")
 
 
 async def setup(bot):
